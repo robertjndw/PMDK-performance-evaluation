@@ -1,0 +1,1907 @@
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/Makefile /pmdk/src/benchmarks/Makefile
+--- /pmdk-original/src/benchmarks/Makefile	2021-05-07 16:50:29.441888101 +0200
++++ /pmdk/src/benchmarks/Makefile	2021-05-07 15:49:10.759831367 +0200
+@@ -42,6 +42,9 @@
+     pmem_memset.cpp\
+     pmem_memcpy.cpp\
+     pmem_flush.cpp\
++	pmem2_flush.cpp\
++	pmem2_memset.cpp\
++    pmem2_memcpy.cpp\
+     pmemobj_gen.cpp\
+     pmemobj_persist.cpp\
+     obj_pmalloc.cpp\
+@@ -84,7 +87,7 @@
+ LIBS += ../debug/libpmemcommon.a
+ endif
+ CFLAGS += $(LIBNDCTL_CFLAGS)
+-LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmempool -lpmem -pthread -lm \
++LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmempool -lpmem -lpmem2 -pthread -lm \
+ 	$(LIBDL) $(LIBUUID) $(LIBNDCTL_LIBS)
+ ifeq ($(LIBRT_NEEDED), y)
+ LIBS += -lrt
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem2_flush.cpp /pmdk/src/benchmarks/pmem2_flush.cpp
+--- /pmdk-original/src/benchmarks/pmem2_flush.cpp	1970-01-01 01:00:00.000000000 +0100
++++ /pmdk/src/benchmarks/pmem2_flush.cpp	2021-05-07 15:49:10.763831360 +0200
+@@ -0,0 +1,489 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Copyright 2016-2020, Intel Corporation */
++
++/*
++ * pmem2_flush.cpp -- benchmark implementation for pmem2_get_persist_fn
++ */
++#include <cassert>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <libpmem2.h>
++#include <libpmem.h>
++
++#include "benchmark.hpp"
++#include "file.h"
++
++#define PAGE_4K ((uintptr_t)1 << 12)
++#define PAGE_2M ((uintptr_t)1 << 21)
++
++/*
++ * align_addr -- round addr down to given boundary
++ */
++static void *
++align_addr(void *addr, uintptr_t align)
++{
++	return (char *)((uintptr_t)addr & ~(align - 1));
++}
++
++/*
++ * align_len -- increase len by the amount we gain when we round addr down
++ */
++static size_t
++align_len(size_t len, void *addr, uintptr_t align)
++{
++	return len + ((uintptr_t)addr & (align - 1));
++}
++
++/*
++ * roundup_len -- increase len by the amount we gain when we round addr down,
++ *                then round up to the nearest multiple of 4K
++ */
++static size_t
++roundup_len(size_t len, void *addr, uintptr_t align)
++{
++	return (align_len(len, addr, align) + align - 1) & ~(align - 1);
++}
++
++/*
++ * pmem_args -- benchmark specific arguments
++ */
++struct pmem_args {
++	char *operation; /* msync, dummy_msync, persist, ... */
++	char *mode;	 /* stat, seq, rand */
++	bool no_warmup;	 /* don't do warmup */
++};
++
++/*
++ * pmem_bench -- benchmark context
++ */
++struct pmem_bench {
++	struct pmem2_map *map; /* Map used for persist operations */
++	int fd;
++
++	uint64_t *offsets; /* write offsets */
++	size_t n_offsets;  /* number of elements in offsets array */
++	size_t fsize;	   /* The size of the allocated PMEM */
++
++	struct pmem_args *pargs; /* prog_args structure */
++
++	void *pmem_addr; /* PMEM base address */
++	size_t pmem_len; /* length of PMEM mapping */
++
++	void *invalid_addr;  /* invalid pages */
++	void *nondirty_addr; /* non-dirty pages */
++
++	void *pmem_addr_aligned;     /* PMEM pages - 2M aligned */
++	void *invalid_addr_aligned;  /* invalid pages - 2M aligned */
++	void *nondirty_addr_aligned; /* non-dirty pages - 2M aligned */
++
++	/* the actual benchmark operation */
++	int (*func_op)(struct pmem_bench *pmb, void *addr, size_t len);
++};
++
++/*
++ * mode_seq -- if copy mode is sequential, returns index of a chunk.
++ */
++static uint64_t
++mode_seq(struct pmem_bench *pmb, uint64_t index)
++{
++	return index;
++}
++
++/*
++ * mode_stat -- if mode is static, the offset is always 0
++ */
++static uint64_t
++mode_stat(struct pmem_bench *pmb, uint64_t index)
++{
++	return 0;
++}
++
++/*
++ * mode_rand -- if mode is random, returns index of a random chunk
++ */
++static uint64_t
++mode_rand(struct pmem_bench *pmb, uint64_t index)
++{
++	return rand() % pmb->n_offsets;
++}
++
++/*
++ * operation_mode -- the mode of the copy process
++ *
++ *	* static     - write always the same chunk,
++ *	* sequential - write chunk by chunk,
++ *	* random     - write to chunks selected randomly.
++ */
++struct op_mode {
++	const char *mode;
++	uint64_t (*func_mode)(struct pmem_bench *pmb, uint64_t index);
++};
++
++static struct op_mode modes[] = {
++	{"stat", mode_stat},
++	{"seq", mode_seq},
++	{"rand", mode_rand},
++};
++
++#define MODES (sizeof(modes) / sizeof(modes[0]))
++
++/*
++ * parse_op_mode -- parses command line "--mode"
++ * and returns proper operation mode index.
++ */
++static int
++parse_op_mode(const char *arg)
++{
++	for (unsigned i = 0; i < MODES; i++) {
++		if (strcmp(arg, modes[i].mode) == 0)
++			return i;
++	}
++	return -1;
++}
++
++/*
++ * flush_noop -- dummy flush, does nothing
++ */
++static int
++flush_noop(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	//fprintf(stderr, "Noop\n");
++	return 0;
++}
++
++/*
++ * flush_persist -- flush data to persistence using pmem_persist()
++ */
++static int
++flush_persist(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	pmem2_persist_fn persist = pmem2_get_persist_fn(pmb->map);
++	persist(addr, len);
++	//fprintf(stderr, "%ld\n", len);
++
++	// old pmem
++	//pmem_persist(addr, len);
++	return 0;
++}
++
++/*
++ * flush_persist_4K -- always flush entire 4K page(s) using pmem_persist()
++ */
++static int
++flush_persist_4K(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	void *ptr = align_addr(addr, PAGE_4K);
++	len = roundup_len(len, addr, PAGE_4K);
++
++	pmem2_persist_fn persist = pmem2_get_persist_fn(pmb->map);
++	persist(ptr, len);
++
++	// old pmem
++	//pmem_persist(ptr, len);
++	return 0;
++}
++
++/*
++ * flush_persist_2M -- always flush entire 2M page(s) using pmem_persist()
++ */
++static int
++flush_persist_2M(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	void *ptr = align_addr(addr, PAGE_2M);
++	len = roundup_len(len, addr, PAGE_2M);
++
++	pmem2_persist_fn persist = pmem2_get_persist_fn(pmb->map);
++	persist(ptr, len);
++
++	// old pmem
++	//pmem_persist(ptr, len);
++	return 0;
++}
++
++
++struct op {
++	const char *opname;
++	int (*func_op)(struct pmem_bench *pmb, void *addr, size_t len);
++};
++
++static struct op ops[] = {
++	{"noop", flush_noop},
++	{"persist", flush_persist},
++	{"persist_4K", flush_persist_4K},
++	{"persist_2M", flush_persist_2M},
++};
++
++#define NOPS (sizeof(ops) / sizeof(ops[0]))
++
++/*
++ * parse_op_type -- parses command line "--operation" argument
++ * and returns proper operation type.
++ */
++static int
++parse_op_type(const char *arg)
++{
++	for (unsigned i = 0; i < NOPS; i++) {
++		if (strcmp(arg, ops[i].opname) == 0)
++			return i;
++	}
++	return -1;
++}
++
++// Imitates the pmem method pmem_map_file with the concept of pmem2
++static int
++pmem2_map_file(const char *path, struct pmem_bench *bench, mode_t mode) {
++	int open_flags = O_RDWR | O_CREAT | O_EXCL;
++	size_t len = bench->fsize;
++	struct pmem2_config *cfg;
++	struct pmem2_source *src;
++
++	if ((bench->fd = os_open(path, open_flags, mode)) < 0) {
++		perror("open");	
++		return -1;
++	}
++
++	if (os_ftruncate(bench->fd, (os_off_t)len) != 0) {
++		perror("!ftruncate");
++		goto err_fd;
++	}
++
++	if (pmem2_config_new(&cfg)) {
++		pmem2_perror("pmem2_config_new");
++		goto err_fd;
++	}
++
++	if (pmem2_config_set_required_store_granularity(cfg,
++			PMEM2_GRANULARITY_PAGE)) {
++		pmem2_perror("pmem2_config_set_required_store_granularity");
++		goto err_source_delete;
++	}
++
++	if (pmem2_source_from_fd(&src, bench->fd)) {
++		pmem2_perror("pmem2_source_from_fd");
++		goto err_delete_config;
++	}
++
++	if (pmem2_map_new(&bench->map, cfg, src)) {
++		pmem2_perror("pmem2_map_new");
++		goto err_source_delete;
++	}
++
++	pmem2_source_delete(&src);
++	pmem2_config_delete(&cfg);
++
++	return 0;
++
++err_source_delete:
++	pmem2_source_delete(&src);
++err_delete_config:
++	pmem2_config_delete(&cfg);
++err_fd:
++	os_close(bench->fd);
++
++	return -1;
++}
++
++/*
++ * pmem2_persist_init -- benchmark initialization
++ *
++ * Parses command line arguments, allocates persistent memory, and maps it.
++ */
++static int
++pmem2_flush_init(struct benchmark *bench, struct benchmark_args *args)
++{
++	assert(bench != nullptr);
++	assert(args != nullptr);
++
++	enum file_type type = util_file_get_type(args->fname);
++	if (type == OTHER_ERROR) {
++		fprintf(stderr, "could not check type of file %s\n",
++			args->fname);
++		return -1;
++	}
++
++	uint64_t (*func_mode)(struct pmem_bench * pmb, uint64_t index);
++
++	auto *pmb = (struct pmem_bench *)malloc(sizeof(struct pmem_bench));
++	assert(pmb != nullptr);
++
++	pmb->pargs = (struct pmem_args *)args->opts;
++	assert(pmb->pargs != nullptr);
++
++
++	int i = parse_op_type(pmb->pargs->operation);
++	if (i == -1) {
++		fprintf(stderr, "wrong operation: %s\n", pmb->pargs->operation);
++		goto err_free_pmb;
++	}
++	pmb->func_op = ops[i].func_op;
++
++	pmb->n_offsets = args->n_ops_per_thread * args->n_threads;
++
++	pmb->fsize = pmb->n_offsets * args->dsize + (2 * PAGE_2M);
++
++	/* round up to 2M boundary */
++	pmb->fsize = (pmb->fsize + PAGE_2M - 1) & ~(PAGE_2M - 1);
++
++	i = parse_op_mode(pmb->pargs->mode);
++	if (i == -1) {
++		fprintf(stderr, "wrong mode: %s\n", pmb->pargs->mode);
++		goto err_free_pmb;
++	}
++	func_mode = modes[i].func_mode;
++
++	/* populate offsets array */
++	assert(pmb->n_offsets != 0);
++	pmb->offsets = (size_t *)malloc(pmb->n_offsets * sizeof(*pmb->offsets));
++	assert(pmb->offsets != nullptr);
++
++	for (size_t i = 0; i < pmb->n_offsets; ++i)
++		pmb->offsets[i] = func_mode(pmb, i);
++
++
++	/* create a pmem file and memory map it */
++	pmem2_map_file(args->fname, pmb, args->fmode);
++	pmb->pmem_addr = pmem2_map_get_address(pmb->map);
++	
++	if (pmb->pmem_addr == nullptr) {
++		perror("pmem2_map_file");
++		goto err_free_pmb;
++	}
++
++	pmb->nondirty_addr = mmap(nullptr, pmb->fsize, PROT_READ | PROT_WRITE,
++				  MAP_PRIVATE | MAP_ANON, -1, 0);
++
++	if (pmb->nondirty_addr == MAP_FAILED) {
++		perror("mmap(1)");
++		goto err_unmap1;
++	}
++
++	pmb->invalid_addr = mmap(nullptr, pmb->fsize, PROT_READ | PROT_WRITE,
++				 MAP_PRIVATE | MAP_ANON, -1, 0);
++
++	if (pmb->invalid_addr == MAP_FAILED) {
++		perror("mmap(2)");
++		goto err_unmap2;
++	}
++	munmap(pmb->invalid_addr, pmb->fsize);
++
++	pmb->pmem_addr_aligned =
++		(void *)(((uintptr_t)pmb->pmem_addr + PAGE_2M - 1) &
++			 ~(PAGE_2M - 1));
++
++	pmb->nondirty_addr_aligned =
++		(void *)(((uintptr_t)pmb->nondirty_addr + PAGE_2M - 1) &
++			 ~(PAGE_2M - 1));
++
++	pmb->invalid_addr_aligned =
++		(void *)(((uintptr_t)pmb->invalid_addr + PAGE_2M - 1) &
++			 ~(PAGE_2M - 1));
++
++	pmembench_set_priv(bench, pmb);
++	
++	if (!pmb->pargs->no_warmup) {
++		size_t off;
++		for (off = 0; off < pmb->fsize - PAGE_2M; off += PAGE_4K) {
++			*(int *)((char *)pmb->pmem_addr_aligned + off) = 0;
++			*(int *)((char *)pmb->nondirty_addr_aligned + off) = 0;
++		}
++	}
++	
++	return 0;
++
++err_unmap2:
++	munmap(pmb->nondirty_addr, pmb->fsize);
++err_unmap1:
++	pmem2_map_delete(&pmb->map);
++err_free_pmb:
++	free(pmb);
++
++	return -1;
++	
++}
++
++/*
++ * pmem_flush_exit -- benchmark cleanup
++ */
++static int
++pmem2_flush_exit(struct benchmark *bench, struct benchmark_args *args)
++{
++	auto *pmb = (struct pmem_bench *)pmembench_get_priv(bench);
++	pmem2_map_delete(&pmb->map);
++	os_close(pmb->fd);
++	
++	munmap(pmb->nondirty_addr, pmb->fsize);
++	free(pmb);
++
++	return 0;
++}
++
++/*
++ * pmem_flush_operation -- actual benchmark operation
++ */
++static int
++pmem2_flush_operation(struct benchmark *bench, struct operation_info *info)
++{
++	auto *pmb = (struct pmem_bench *)pmembench_get_priv(bench);
++
++	size_t op_idx = info->index;
++	assert(op_idx < pmb->n_offsets);
++
++	uint64_t chunk_idx = pmb->offsets[op_idx];
++	void *addr = (char *)pmb->pmem_addr_aligned + chunk_idx * info->args->dsize;
++	
++	/* store + flush */
++	*(int *)addr = *(int *)addr + 1;
++	pmb->func_op(pmb, addr, info->args->dsize);
++	return 0;
++}
++
++/* structure to define command line arguments */
++static struct benchmark_clo pmem2_persist_clo[3];
++/* Stores information about benchmark. */
++static struct benchmark_info pmem2_persist_bench;
++CONSTRUCTOR(pmem2_flush_constructor)
++void
++pmem2_flush_constructor(void)
++{
++	pmem2_persist_clo[0].opt_short = 'o';
++	pmem2_persist_clo[0].opt_long = "operation";
++	pmem2_persist_clo[0].descr = "Operation type - persist, persist_4k, persist_2M";
++	pmem2_persist_clo[0].type = CLO_TYPE_STR;
++	pmem2_persist_clo[0].off = clo_field_offset(struct pmem_args, operation);
++	pmem2_persist_clo[0].def = "noop";
++
++	pmem2_persist_clo[1].opt_short = 0;
++	pmem2_persist_clo[1].opt_long = "mode";
++	pmem2_persist_clo[1].descr = "mode - stat, seq or rand";
++	pmem2_persist_clo[1].type = CLO_TYPE_STR;
++	pmem2_persist_clo[1].off = clo_field_offset(struct pmem_args, mode);
++	pmem2_persist_clo[1].def = "stat";
++
++	pmem2_persist_clo[2].opt_short = 'w';
++	pmem2_persist_clo[2].opt_long = "no-warmup";
++	pmem2_persist_clo[2].descr = "Don't do warmup";
++	pmem2_persist_clo[2].type = CLO_TYPE_FLAG;
++	pmem2_persist_clo[2].off = clo_field_offset(struct pmem_args, no_warmup);
++
++	pmem2_persist_bench.name = "pmem2_persist";
++	pmem2_persist_bench.brief = "Benchmark for pmem2_get_persist_fn() ";
++	pmem2_persist_bench.init = pmem2_flush_init;
++	pmem2_persist_bench.exit = pmem2_flush_exit;
++	pmem2_persist_bench.multithread = true;
++	pmem2_persist_bench.multiops = true;
++	pmem2_persist_bench.operation = pmem2_flush_operation;
++	pmem2_persist_bench.measure_time = true;
++	pmem2_persist_bench.clos = pmem2_persist_clo;
++	pmem2_persist_bench.nclos = ARRAY_SIZE(pmem2_persist_clo);
++	pmem2_persist_bench.opts_size = sizeof(struct pmem_args);
++	pmem2_persist_bench.rm_file = true;
++	pmem2_persist_bench.allow_poolset = false;
++	REGISTER_BENCHMARK(pmem2_persist_bench);
++}
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem2_memcpy.cpp /pmdk/src/benchmarks/pmem2_memcpy.cpp
+--- /pmdk-original/src/benchmarks/pmem2_memcpy.cpp	1970-01-01 01:00:00.000000000 +0100
++++ /pmdk/src/benchmarks/pmem2_memcpy.cpp	2021-05-07 15:49:10.763831360 +0200
+@@ -0,0 +1,676 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Copyright 2015-2019, Intel Corporation */
++
++/*
++ * pmem2_memcpy.cpp -- benchmark implementation for pmem2_get_memcpy_fn()
++ */
++#include <cassert>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <libpmem.h>
++#include <libpmem2.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "benchmark.hpp"
++#include "file.h"
++
++#define FLUSH_ALIGN 64
++
++#define MAX_OFFSET (FLUSH_ALIGN - 1)
++
++struct pmem_bench;
++
++typedef size_t (*offset_fn)(struct pmem_bench *pmb,
++			    struct operation_info *info);
++
++/*
++ * pmem_args -- benchmark specific arguments
++ */
++struct pmem_args {
++	/*
++	 * Defines the copy operation direction. Whether it is
++	 * writing from RAM to PMEM (for argument value "write")
++	 * or PMEM to RAM (for argument value "read").
++	 */
++	char *operation;
++
++	/*
++	 * The source address offset used to test pmem_memcpy()
++	 * performance when source address is not aligned.
++	 */
++	size_t src_off;
++
++	/*
++	 * The destination address offset used to test
++	 * pmem_memcpy() performance when destination address
++	 * is not aligned.
++	 */
++	size_t dest_off;
++
++	/* The size of data chunk. */
++	size_t chunk_size;
++
++	/*
++	 * Specifies the order in which data chunks are selected
++	 * to be copied. There are three modes supported:
++	 * stat, seq, rand.
++	 */
++	char *src_mode;
++
++	/*
++	 * Specifies the order in which data chunks are written
++	 * to the destination address. There are three modes
++	 * supported: stat, seq, rand.
++	 */
++	char *dest_mode;
++
++	/*
++	 * When this flag is set to true, PMEM is not used.
++	 * This option is useful, when comparing performance
++	 * of pmem_memcpy() function to regular memcpy().
++	 */
++	bool memcpy;
++
++	/*
++	 * When this flag is set to true, pmem_persist()
++	 * function is used, otherwise pmem_flush() is performed.
++	 */
++	bool persist;
++
++	/* do not do warmup */
++	bool no_warmup;
++};
++
++/*
++ * pmem_bench -- benchmark context
++ */
++struct pmem_bench {
++	/* random offsets */
++	unsigned *rand_offsets;
++
++	/* number of elements in randoms array */
++	size_t n_rand_offsets;
++
++	/* The size of the allocated PMEM */
++	size_t fsize;
++
++	/* The size of the allocated buffer */
++	size_t bsize;
++
++	/* Pointer to the allocated volatile memory */
++	unsigned char *buf;
++
++	/* Pointer to the allocated PMEM */
++	unsigned char *pmem_addr;
++
++	/*
++	 * This field gets 'buf' or 'pmem_addr' fields assigned,
++	 * depending on the prog_args operation direction.
++	 */
++	unsigned char *src_addr;
++
++	/*
++	 * This field gets 'buf' or 'pmem_addr' fields assigned,
++	 * depending on the prog_args operation direction.
++	 */
++	unsigned char *dest_addr;
++
++	/* Stores prog_args structure */
++	struct pmem_args *pargs;
++
++	/*
++	 * Function which returns src offset. Matches src_mode.
++	 */
++	offset_fn func_src;
++
++	/*
++	 * Function which returns dst offset. Matches dst_mode.
++	 */
++	offset_fn func_dest;
++
++	/*
++	 * The actual operation performed based on benchmark specific
++	 * arguments.
++	 */
++	int (*func_op)(void *dest, void *source, size_t len, pmem2_map *map);
++
++	/*
++	 * Map used for persist operations
++	 */
++	struct pmem2_map *map;
++};
++
++/*
++ * operation_type -- type of operation relative to persistent memory
++ */
++enum operation_type { OP_TYPE_UNKNOWN, OP_TYPE_READ, OP_TYPE_WRITE };
++
++/*
++ * operation_mode -- the mode of the copy process
++ *
++ *	* static - read/write always the same chunk,
++ *	* sequential - read/write chunk by chunk,
++ *	* random - read/write to chunks selected randomly.
++ *
++ *  It is used to determine source mode as well as the destination mode.
++ */
++enum operation_mode {
++	OP_MODE_UNKNOWN,
++	OP_MODE_STAT,
++	OP_MODE_SEQ,
++	OP_MODE_RAND
++};
++
++/*
++ * parse_op_type -- parses command line "--operation" argument
++ * and returns proper operation type.
++ */
++static enum operation_type
++parse_op_type(const char *arg)
++{
++	if (strcmp(arg, "read") == 0)
++		return OP_TYPE_READ;
++	else if (strcmp(arg, "write") == 0)
++		return OP_TYPE_WRITE;
++	else
++		return OP_TYPE_UNKNOWN;
++}
++
++/*
++ * parse_op_mode -- parses command line "--src-mode" or "--dest-mode"
++ * and returns proper operation mode.
++ */
++static enum operation_mode
++parse_op_mode(const char *arg)
++{
++	if (strcmp(arg, "stat") == 0)
++		return OP_MODE_STAT;
++	else if (strcmp(arg, "seq") == 0)
++		return OP_MODE_SEQ;
++	else if (strcmp(arg, "rand") == 0)
++		return OP_MODE_RAND;
++	else
++		return OP_MODE_UNKNOWN;
++}
++
++/*
++ * mode_seq -- if copy mode is sequential mode_seq() returns
++ * index of a chunk.
++ */
++static uint64_t
++mode_seq(struct pmem_bench *pmb, struct operation_info *info)
++{
++	return info->args->n_ops_per_thread * info->worker->index + info->index;
++}
++
++/*
++ * mode_stat -- if mode is static, the offset is always 0,
++ * as only one block is used.
++ */
++static uint64_t
++mode_stat(struct pmem_bench *pmb, struct operation_info *info)
++{
++	return 0;
++}
++
++/*
++ * mode_rand -- if mode is random returns index of a random chunk
++ */
++static uint64_t
++mode_rand(struct pmem_bench *pmb, struct operation_info *info)
++{
++	assert(info->index < pmb->n_rand_offsets);
++	return info->args->n_ops_per_thread * info->worker->index +
++		pmb->rand_offsets[info->index];
++}
++
++/*
++ * assign_mode_func -- parses "--src-mode" and "--dest-mode" command line
++ * arguments and returns one of the above mode functions.
++ */
++static offset_fn
++assign_mode_func(char *option)
++{
++	enum operation_mode op_mode = parse_op_mode(option);
++
++	switch (op_mode) {
++		case OP_MODE_STAT:
++			return mode_stat;
++		case OP_MODE_SEQ:
++			return mode_seq;
++		case OP_MODE_RAND:
++			return mode_rand;
++		default:
++			return nullptr;
++	}
++}
++
++/*
++ * libc_memcpy -- copy using libc memcpy() function
++ * followed by pmem_flush().
++ */
++static int
++libc_memcpy(void *dest, void *source, size_t len, pmem2_map *map)
++{
++	memcpy(dest, source, len);
++
++	pmem2_flush_fn flush = pmem2_get_flush_fn(map);
++	flush(dest, len);
++
++	return 0;
++}
++
++/*
++ * libc_memcpy_persist -- copy using libc memcpy() function
++ * followed by pmem_persist().
++ */
++static int
++libc_memcpy_persist(void *dest, void *source, size_t len, pmem2_map *map)
++{
++	memcpy(dest, source, len);
++
++	pmem2_persist_fn persist_fn = pmem2_get_persist_fn(map);
++	persist_fn(dest, len);
++
++	return 0;
++}
++
++/*
++ * lipmem_memcpy_nodrain -- copy using libpmem pmem_memcpy_no_drain()
++ * function without pmem_persist().
++ */
++static int
++libpmem_memcpy_nodrain(void *dest, void *source, size_t len, pmem2_map *map)
++{
++	//pmem_memcpy_nodrain(dest, source, len);
++
++	pmem2_memcpy_fn memcpy = pmem2_get_memcpy_fn(map);
++	memcpy(dest, source, len, PMEM2_F_MEM_NODRAIN);
++
++	return 0;
++}
++
++/*
++ * libpmem_memcpy_persist -- copy using libpmem pmem_memcpy_persist() function.
++ */
++static int
++libpmem_memcpy_persist(void *dest, void *source, size_t len, pmem2_map *map)
++{
++	//pmem_memcpy_persist(dest, source, len);
++
++	pmem2_memcpy_fn memcpy = pmem2_get_memcpy_fn(map);
++	memcpy(dest, source, len, 0);
++
++	return 0;
++}
++
++/*
++ * assign_size -- assigns file and buffer size
++ * depending on the operation mode and type.
++ */
++static int
++assign_size(struct pmem_bench *pmb, struct benchmark_args *args,
++	    enum operation_type *op_type)
++{
++	*op_type = parse_op_type(pmb->pargs->operation);
++
++	if (*op_type == OP_TYPE_UNKNOWN) {
++		fprintf(stderr, "Invalid operation argument '%s'",
++			pmb->pargs->operation);
++		return -1;
++	}
++	enum operation_mode op_mode_src = parse_op_mode(pmb->pargs->src_mode);
++	if (op_mode_src == OP_MODE_UNKNOWN) {
++		fprintf(stderr, "Invalid source mode argument '%s'",
++			pmb->pargs->src_mode);
++		return -1;
++	}
++	enum operation_mode op_mode_dest = parse_op_mode(pmb->pargs->dest_mode);
++	if (op_mode_dest == OP_MODE_UNKNOWN) {
++		fprintf(stderr, "Invalid destination mode argument '%s'",
++			pmb->pargs->dest_mode);
++		return -1;
++	}
++
++	size_t large = args->n_ops_per_thread * pmb->pargs->chunk_size *
++		args->n_threads;
++	size_t little = pmb->pargs->chunk_size;
++
++	if (*op_type == OP_TYPE_WRITE) {
++		pmb->bsize = op_mode_src == OP_MODE_STAT ? little : large;
++		pmb->fsize = op_mode_dest == OP_MODE_STAT ? little : large;
++
++		if (pmb->pargs->src_off != 0)
++			pmb->bsize += MAX_OFFSET;
++		if (pmb->pargs->dest_off != 0)
++			pmb->fsize += MAX_OFFSET;
++	} else {
++		pmb->fsize = op_mode_src == OP_MODE_STAT ? little : large;
++		pmb->bsize = op_mode_dest == OP_MODE_STAT ? little : large;
++
++		if (pmb->pargs->src_off != 0)
++			pmb->fsize += MAX_OFFSET;
++		if (pmb->pargs->dest_off != 0)
++			pmb->bsize += MAX_OFFSET;
++	}
++
++	return 0;
++}
++
++// Imitates the pmem method pmem_map_file with the concept of pmem2
++static struct pmem2_map*
++pmem2_map_file(const char *path, size_t len, mode_t mode) {
++	int fd;
++	int open_flags = O_RDWR | O_CREAT | O_EXCL;
++
++	struct pmem2_config *cfg;
++	struct pmem2_map *map;
++	struct pmem2_source *src;
++
++	if ((fd = os_open(path, open_flags, mode)) < 0) {
++		perror("open");	
++		return NULL;
++	}
++
++	if (os_ftruncate(fd, (os_off_t)len) != 0) {
++		perror("!ftruncate");
++		goto err_fd;
++	}
++
++
++	if (pmem2_config_new(&cfg)) {
++		pmem2_perror("pmem2_config_new");
++		goto err_fd;
++	}
++
++	if (pmem2_source_from_fd(&src, fd)) {
++		pmem2_perror("pmem2_source_from_fd");
++		goto err_delete_config;
++	}
++
++	if (pmem2_config_set_required_store_granularity(cfg,
++			PMEM2_GRANULARITY_PAGE)) {
++		pmem2_perror("pmem2_config_set_required_store_granularity");
++		goto err_source_delete;
++	}
++
++	if (pmem2_map_new(&map, cfg, src)) {
++		pmem2_perror("pmem2_map_new");
++		goto err_source_delete;
++	}
++
++	//pmem2_source_delete(&src);
++	//pmem2_config_delete(&cfg);
++	//os_close(fd);
++
++	return map;
++
++err_source_delete:
++	pmem2_source_delete(&src);
++err_delete_config:
++	pmem2_config_delete(&cfg);
++err_fd:
++	os_close(fd);
++
++	return NULL;
++}
++
++/*
++ * pmem_memcpy_init -- benchmark initialization
++ *
++ * Parses command line arguments, allocates persistent memory, and maps it.
++ */
++static int
++pmem_memcpy_init(struct benchmark *bench, struct benchmark_args *args)
++{
++	assert(bench != nullptr);
++	assert(args != nullptr);
++	int ret = 0;
++
++	enum file_type type = util_file_get_type(args->fname);
++	if (type == OTHER_ERROR) {
++		fprintf(stderr, "could not check type of file %s\n",
++			args->fname);
++		return -1;
++	}
++
++	auto *pmb = (struct pmem_bench *)malloc(sizeof(struct pmem_bench));
++	assert(pmb != nullptr);
++
++	pmb->pargs = (struct pmem_args *)args->opts;
++	assert(pmb->pargs != nullptr);
++
++	pmb->pargs->chunk_size = args->dsize;
++
++	enum operation_type op_type;
++	/*
++	 * Assign file and buffer size depending on the operation type
++	 * (READ from PMEM or WRITE to PMEM)
++	 */
++	if (assign_size(pmb, args, &op_type) != 0) {
++		ret = -1;
++		goto err_free_pmb;
++	}
++	pmb->buf =
++		(unsigned char *)util_aligned_malloc(FLUSH_ALIGN, pmb->bsize);
++	if (pmb->buf == nullptr) {
++		perror("posix_memalign");
++		ret = -1;
++		goto err_free_pmb;
++	}
++
++	pmb->n_rand_offsets = args->n_ops_per_thread * args->n_threads;
++	assert(pmb->n_rand_offsets != 0);
++	pmb->rand_offsets = (unsigned *)malloc(pmb->n_rand_offsets *
++					       sizeof(*pmb->rand_offsets));
++
++	if (pmb->rand_offsets == nullptr) {
++		perror("malloc");
++		ret = -1;
++		goto err_free_pmb_buf;
++	}
++
++	for (size_t i = 0; i < pmb->n_rand_offsets; ++i)
++		pmb->rand_offsets[i] = rand() % args->n_ops_per_thread;
++
++	/* create a pmem file and memory map it */
++	pmb->map = pmem2_map_file(args->fname, pmb->fsize, args->fmode);
++	pmb->pmem_addr = (unsigned char *)pmem2_map_get_address(pmb->map);
++
++	if (pmb->pmem_addr == nullptr) {
++		perror(args->fname);
++		ret = -1;
++		goto err_free_pmb_rand_offsets;
++	}
++
++	if (op_type == OP_TYPE_READ) {
++		pmb->src_addr = pmb->pmem_addr;
++		pmb->dest_addr = pmb->buf;
++	} else {
++		pmb->src_addr = pmb->buf;
++		pmb->dest_addr = pmb->pmem_addr;
++	}
++
++	/* set proper func_src() and func_dest() depending on benchmark args */
++	if ((pmb->func_src = assign_mode_func(pmb->pargs->src_mode)) ==
++	    nullptr) {
++		fprintf(stderr, "wrong src_mode parameter -- '%s'",
++			pmb->pargs->src_mode);
++		ret = -1;
++		goto err_unmap;
++	}
++
++	if ((pmb->func_dest = assign_mode_func(pmb->pargs->dest_mode)) ==
++	    nullptr) {
++		fprintf(stderr, "wrong dest_mode parameter -- '%s'",
++			pmb->pargs->dest_mode);
++		ret = -1;
++		goto err_unmap;
++	}
++
++	if (pmb->pargs->memcpy) {
++		pmb->func_op =
++			pmb->pargs->persist ? libc_memcpy_persist : libc_memcpy;
++	} else {
++		pmb->func_op = pmb->pargs->persist ? libpmem_memcpy_persist
++						   : libpmem_memcpy_nodrain;
++	}
++
++	if (!pmb->pargs->no_warmup) {
++		memset(pmb->buf, 0, pmb->bsize);
++		pmem_memset_persist(pmb->pmem_addr, 0, pmb->fsize);
++	}
++
++	pmembench_set_priv(bench, pmb);
++
++	return 0;
++
++err_unmap:
++	pmem2_map_delete(&pmb->map);
++err_free_pmb_rand_offsets:
++	free(pmb->rand_offsets);
++err_free_pmb_buf:
++	util_aligned_free(pmb->buf);
++err_free_pmb:
++	free(pmb);
++
++	return ret;
++}
++
++/*
++ * pmem_memcpy_operation -- actual benchmark operation
++ *
++ * Depending on the memcpy flag "-m" tested operation will be memcpy()
++ * or pmem_memcpy_persist().
++ */
++static int
++pmem_memcpy_operation(struct benchmark *bench, struct operation_info *info)
++{
++	auto *pmb = (struct pmem_bench *)pmembench_get_priv(bench);
++
++	size_t src_index = pmb->func_src(pmb, info);
++
++	size_t dest_index = pmb->func_dest(pmb, info);
++
++	void *source = pmb->src_addr + src_index * pmb->pargs->chunk_size +
++		pmb->pargs->src_off;
++	void *dest = pmb->dest_addr + dest_index * pmb->pargs->chunk_size +
++		pmb->pargs->dest_off;
++	size_t len = pmb->pargs->chunk_size;
++
++	pmb->func_op(dest, source, len, pmb->map);
++	return 0;
++}
++
++/*
++ * pmem_memcpy_exit -- benchmark cleanup
++ */
++static int
++pmem_memcpy_exit(struct benchmark *bench, struct benchmark_args *args)
++{
++	auto *pmb = (struct pmem_bench *)pmembench_get_priv(bench);
++	pmem2_map_delete(&pmb->map);
++	util_aligned_free(pmb->buf);
++	free(pmb->rand_offsets);
++	free(pmb);
++	return 0;
++}
++
++/* structure to define command line arguments */
++static struct benchmark_clo pmem_memcpy_clo[8];
++
++/* Stores information about benchmark. */
++static struct benchmark_info pmem_memcpy_bench;
++CONSTRUCTOR(pmem_memcpy_constructor)
++void
++pmem_memcpy_constructor(void)
++{
++	pmem_memcpy_clo[0].opt_short = 'o';
++	pmem_memcpy_clo[0].opt_long = "operation";
++	pmem_memcpy_clo[0].descr = "Operation type - write, read";
++	pmem_memcpy_clo[0].type = CLO_TYPE_STR;
++	pmem_memcpy_clo[0].off = clo_field_offset(struct pmem_args, operation);
++	pmem_memcpy_clo[0].def = "write";
++
++	pmem_memcpy_clo[1].opt_short = 'S';
++	pmem_memcpy_clo[1].opt_long = "src-offset";
++	pmem_memcpy_clo[1].descr = "Source cache line alignment"
++				   " offset";
++	pmem_memcpy_clo[1].type = CLO_TYPE_UINT;
++	pmem_memcpy_clo[1].off = clo_field_offset(struct pmem_args, src_off);
++	pmem_memcpy_clo[1].def = "0";
++	pmem_memcpy_clo[1].type_uint.size =
++		clo_field_size(struct pmem_args, src_off);
++	pmem_memcpy_clo[1].type_uint.base = CLO_INT_BASE_DEC;
++	pmem_memcpy_clo[1].type_uint.min = 0;
++	pmem_memcpy_clo[1].type_uint.max = MAX_OFFSET;
++
++	pmem_memcpy_clo[2].opt_short = 'D';
++	pmem_memcpy_clo[2].opt_long = "dest-offset";
++	pmem_memcpy_clo[2].descr = "Destination cache line "
++				   "alignment offset";
++	pmem_memcpy_clo[2].type = CLO_TYPE_UINT;
++	pmem_memcpy_clo[2].off = clo_field_offset(struct pmem_args, dest_off);
++	pmem_memcpy_clo[2].def = "0";
++	pmem_memcpy_clo[2].type_uint.size =
++		clo_field_size(struct pmem_args, dest_off);
++	pmem_memcpy_clo[2].type_uint.base = CLO_INT_BASE_DEC;
++	pmem_memcpy_clo[2].type_uint.min = 0;
++	pmem_memcpy_clo[2].type_uint.max = MAX_OFFSET;
++
++	pmem_memcpy_clo[3].opt_short = 0;
++	pmem_memcpy_clo[3].opt_long = "src-mode";
++	pmem_memcpy_clo[3].descr = "Source reading mode";
++	pmem_memcpy_clo[3].type = CLO_TYPE_STR;
++	pmem_memcpy_clo[3].off = clo_field_offset(struct pmem_args, src_mode);
++	pmem_memcpy_clo[3].def = "seq";
++
++	pmem_memcpy_clo[4].opt_short = 0;
++	pmem_memcpy_clo[4].opt_long = "dest-mode";
++	pmem_memcpy_clo[4].descr = "Destination writing mode";
++	pmem_memcpy_clo[4].type = CLO_TYPE_STR;
++	pmem_memcpy_clo[4].off = clo_field_offset(struct pmem_args, dest_mode);
++	pmem_memcpy_clo[4].def = "seq";
++
++	pmem_memcpy_clo[5].opt_short = 'm';
++	pmem_memcpy_clo[5].opt_long = "libc-memcpy";
++	pmem_memcpy_clo[5].descr = "Use libc memcpy()";
++	pmem_memcpy_clo[5].type = CLO_TYPE_FLAG;
++	pmem_memcpy_clo[5].off = clo_field_offset(struct pmem_args, memcpy);
++	pmem_memcpy_clo[5].def = "false";
++
++	pmem_memcpy_clo[6].opt_short = 'p';
++	pmem_memcpy_clo[6].opt_long = "persist";
++	pmem_memcpy_clo[6].descr = "Use pmem2_persist()";
++	pmem_memcpy_clo[6].type = CLO_TYPE_FLAG;
++	pmem_memcpy_clo[6].off = clo_field_offset(struct pmem_args, persist);
++	pmem_memcpy_clo[6].def = "true";
++
++	pmem_memcpy_clo[7].opt_short = 'w';
++	pmem_memcpy_clo[7].opt_long = "no-warmup";
++	pmem_memcpy_clo[7].descr = "Don't do warmup";
++	pmem_memcpy_clo[7].def = "false";
++	pmem_memcpy_clo[7].type = CLO_TYPE_FLAG;
++	pmem_memcpy_clo[7].off = clo_field_offset(struct pmem_args, no_warmup);
++
++	pmem_memcpy_bench.name = "pmem2_memcpy";
++	pmem_memcpy_bench.brief = "Benchmark for pmem2_get_memcpy_fn()";
++	pmem_memcpy_bench.init = pmem_memcpy_init;
++	pmem_memcpy_bench.exit = pmem_memcpy_exit;
++	pmem_memcpy_bench.multithread = true;
++	pmem_memcpy_bench.multiops = true;
++	pmem_memcpy_bench.operation = pmem_memcpy_operation;
++	pmem_memcpy_bench.measure_time = true;
++	pmem_memcpy_bench.clos = pmem_memcpy_clo;
++	pmem_memcpy_bench.nclos = ARRAY_SIZE(pmem_memcpy_clo);
++	pmem_memcpy_bench.opts_size = sizeof(struct pmem_args);
++	pmem_memcpy_bench.rm_file = true;
++	pmem_memcpy_bench.allow_poolset = false;
++	pmem_memcpy_bench.print_bandwidth = true;
++	REGISTER_BENCHMARK(pmem_memcpy_bench);
++};
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem2_memset.cpp /pmdk/src/benchmarks/pmem2_memset.cpp
+--- /pmdk-original/src/benchmarks/pmem2_memset.cpp	1970-01-01 01:00:00.000000000 +0100
++++ /pmdk/src/benchmarks/pmem2_memset.cpp	2021-05-07 15:49:10.763831360 +0200
+@@ -0,0 +1,483 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Copyright 2015-2020, Intel Corporation */
++/*
++ * pmem2_memset.cpp -- benchmark for pmem2_get_memset_fn function
++ */
++
++#include <cassert>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <libpmem.h>
++#include <libpmem2.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "benchmark.hpp"
++#include "file.h"
++#include "os.h"
++
++#define MAX_OFFSET 63
++#define CONST_B 0xFF
++
++struct memset_bench;
++
++typedef int (*operation_fn)(void *dest, int c, size_t len, pmem2_map *map);
++
++/*
++ * memset_args -- benchmark specific command line options
++ */
++struct memset_args {
++	char *mode;	   /* operation mode: stat, seq, rand */
++	bool memset;	   /* use libc memset function */
++	bool persist;	   /* perform persist operation */
++	bool msync;	   /* perform msync operation */
++	bool no_warmup;	   /* do not do warmup */
++	size_t chunk_size; /* elementary chunk size */
++	size_t dest_off;   /* destination address offset */
++	unsigned seed;	   /* seed for random numbers */
++};
++
++/*
++ * memset_bench -- benchmark context
++ */
++struct memset_bench {
++	struct memset_args *pargs; /* benchmark specific arguments */
++	uint64_t *offsets;	   /* random/sequential address offsets */
++	size_t n_offsets;	   /* number of random elements */
++	int const_b;		   /* memset() value */
++	size_t fsize;		   /* file size */
++	void *pmem_addr;	   /* mapped file address */
++	operation_fn func_op;	   /* operation function */
++
++	struct pmem2_map *map; /* Map used for persist operations */
++};
++
++/*
++ * operation_mode -- mode of operation of memset()
++ */
++enum operation_mode {
++	OP_MODE_UNKNOWN,
++	OP_MODE_STAT, /* always use the same chunk */
++	OP_MODE_SEQ,  /* use consecutive chunks */
++	OP_MODE_RAND  /* use random chunks */
++};
++
++/*
++ * parse_op_mode -- parse operation mode from string
++ */
++static enum operation_mode
++parse_op_mode(const char *arg)
++{
++	if (strcmp(arg, "stat") == 0)
++		return OP_MODE_STAT;
++	else if (strcmp(arg, "seq") == 0)
++		return OP_MODE_SEQ;
++	else if (strcmp(arg, "rand") == 0)
++		return OP_MODE_RAND;
++	else
++		return OP_MODE_UNKNOWN;
++}
++
++/*
++ * init_offsets -- initialize offsets[] array depending on the selected mode
++ */
++static int
++init_offsets(struct benchmark_args *args, struct memset_bench *mb,
++	     enum operation_mode op_mode)
++{
++	unsigned n_threads = args->n_threads;
++	size_t n_ops = args->n_ops_per_thread;
++
++	mb->n_offsets = n_ops * n_threads;
++	assert(mb->n_offsets != 0);
++	mb->offsets = (uint64_t *)malloc(mb->n_offsets * sizeof(*mb->offsets));
++	if (!mb->offsets) {
++		perror("malloc");
++		return -1;
++	}
++
++	rng_t rng;
++	randomize_r(&rng, mb->pargs->seed);
++
++	for (unsigned i = 0; i < n_threads; i++) {
++		for (size_t j = 0; j < n_ops; j++) {
++			size_t o;
++			switch (op_mode) {
++				case OP_MODE_STAT:
++					o = i;
++					break;
++				case OP_MODE_SEQ:
++					o = i * n_ops + j;
++					break;
++				case OP_MODE_RAND:
++					o = i * n_ops + rnd64_r(&rng) % n_ops;
++					break;
++				default:
++					assert(0);
++					return -1;
++			}
++			mb->offsets[i * n_ops + j] = o * mb->pargs->chunk_size;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * libpmem_memset_persist -- perform operation using libpmem
++ * pmem_memset_persist().
++ */
++static int
++libpmem_memset_persist(void *dest, int c, size_t len, pmem2_map *map)
++{
++	//pmem_memset_persist(dest, c, len);
++
++	pmem2_memset_fn memset = pmem2_get_memset_fn(map);
++	memset(dest, c, len, 0);
++
++	return 0;
++}
++
++/*
++ * libpmem_memset_nodrain -- perform operation using libpmem
++ * pmem_memset_nodrain().
++ */
++static int
++libpmem_memset_nodrain(void *dest, int c, size_t len, pmem2_map *map)
++{
++	//pmem_memset_nodrain(dest, c, len);
++
++	pmem2_memset_fn memset = pmem2_get_memset_fn(map);
++	memset(dest, c, len, PMEM2_F_MEM_NODRAIN);
++
++	return 0;
++}
++
++/*
++ * libc_memset_persist -- perform operation using libc memset() function
++ * followed by pmem_persist().
++ */
++static int
++libc_memset_persist(void *dest, int c, size_t len, pmem2_map *map)
++{
++	memset(dest, c, len);
++	pmem2_persist_fn persist_fn = pmem2_get_persist_fn(map);
++	persist_fn(dest, len);
++
++	//pmem_persist(dest, len);
++
++	return 0;
++}
++
++/*
++ * libc_memset -- perform operation using libc memset() function
++ * followed by pmem_flush().
++ */
++static int
++libc_memset(void *dest, int c, size_t len, pmem2_map *map)
++{
++	memset(dest, c, len);
++
++	//pmem_flush(dest, len);
++
++	pmem2_flush_fn flush = pmem2_get_flush_fn(map);
++	flush(dest, len);
++
++	return 0;
++}
++
++/*
++ * warmup_persist -- does the warmup by writing the whole pool area
++ */
++static int
++warmup_persist(struct memset_bench *mb)
++{
++	void *dest = mb->pmem_addr;
++	int c = mb->const_b;
++	size_t len = mb->fsize;
++
++	pmem_memset_persist(dest, c, len);
++
++	return 0;
++}
++
++/*
++ * memset_op -- actual benchmark operation. It can have one of the four
++ * functions assigned:
++ *              libc_memset,
++ *              libc_memset_persist,
++ *              libpmem_memset_nodrain,
++ *              libpmem_memset_persist.
++ */
++static int
++memset_op(struct benchmark *bench, struct operation_info *info)
++{
++	auto *mb = (struct memset_bench *)pmembench_get_priv(bench);
++
++	assert(info->index < mb->n_offsets);
++
++	size_t idx = info->worker->index * info->args->n_ops_per_thread +
++		info->index;
++	void *dest =
++		(char *)mb->pmem_addr + mb->offsets[idx] + mb->pargs->dest_off;
++	int c = mb->const_b;
++	size_t len = mb->pargs->chunk_size;
++
++	mb->func_op(dest, c, len, mb->map);
++
++	return 0;
++}
++
++// Imitates the pmem method pmem_map_file with the concept of pmem2
++static struct pmem2_map*
++pmem2_map_file(const char *path, size_t len, mode_t mode) {
++	int fd;
++	int open_flags = O_RDWR | O_CREAT | O_EXCL;
++
++	struct pmem2_config *cfg;
++	struct pmem2_map *map;
++	struct pmem2_source *src;
++
++	if ((fd = os_open(path, open_flags, mode)) < 0) {
++		perror("open");	
++		return NULL;
++	}
++
++	if (os_ftruncate(fd, (os_off_t)len) != 0) {
++		perror("!ftruncate");
++		goto err_fd;
++	}
++
++
++	if (pmem2_config_new(&cfg)) {
++		pmem2_perror("pmem2_config_new");
++		goto err_fd;
++	}
++
++	if (pmem2_source_from_fd(&src, fd)) {
++		pmem2_perror("pmem2_source_from_fd");
++		goto err_delete_config;
++	}
++
++	if (pmem2_config_set_required_store_granularity(cfg,
++			PMEM2_GRANULARITY_PAGE)) {
++		pmem2_perror("pmem2_config_set_required_store_granularity");
++		goto err_source_delete;
++	}
++
++	if (pmem2_map_new(&map, cfg, src)) {
++		pmem2_perror("pmem2_map_new");
++		goto err_source_delete;
++	}
++
++	//pmem2_source_delete(&src);
++	//pmem2_config_delete(&cfg);
++	//os_close(fd);
++
++	return map;
++
++err_source_delete:
++	pmem2_source_delete(&src);
++err_delete_config:
++	pmem2_config_delete(&cfg);
++err_fd:
++	os_close(fd);
++
++	return NULL;
++}
++
++/*
++ * memset_init -- initialization function
++ */
++static int
++memset_init(struct benchmark *bench, struct benchmark_args *args)
++{
++	assert(bench != nullptr);
++	assert(args != nullptr);
++	assert(args->opts != nullptr);
++
++	int ret = 0;
++	size_t size;
++	size_t large;
++	size_t little;
++
++	enum file_type type = util_file_get_type(args->fname);
++	if (type == OTHER_ERROR) {
++		fprintf(stderr, "could not check type of file %s\n",
++			args->fname);
++		return -1;
++	}
++
++	int (*warmup_func)(struct memset_bench *) = warmup_persist;
++	auto *mb = (struct memset_bench *)malloc(sizeof(struct memset_bench));
++	if (!mb) {
++		perror("malloc");
++		return -1;
++	}
++
++	mb->pargs = (struct memset_args *)args->opts;
++	mb->pargs->chunk_size = args->dsize;
++
++	enum operation_mode op_mode = parse_op_mode(mb->pargs->mode);
++	if (op_mode == OP_MODE_UNKNOWN) {
++		fprintf(stderr, "Invalid operation mode argument '%s'\n",
++			mb->pargs->mode);
++		ret = -1;
++		goto err_free_mb;
++	}
++
++	size = MAX_OFFSET + mb->pargs->chunk_size;
++	large = size * args->n_ops_per_thread * args->n_threads;
++	little = size * args->n_threads;
++
++	mb->fsize = (op_mode == OP_MODE_STAT) ? little : large;
++
++	/* initialize offsets[] array depending on benchmark args */
++	if (init_offsets(args, mb, op_mode) < 0) {
++		ret = -1;
++		goto err_free_mb;
++	}
++
++	/* initialize memset() value */
++	mb->const_b = CONST_B;
++
++	/* create a pmem file and memory map it */
++	mb->map = pmem2_map_file(args->fname, mb->fsize, args->fmode);
++	
++
++	/* create a pmem file and memory map it */
++	if ((mb->pmem_addr = pmem2_map_get_address(mb->map)) == nullptr) {
++		perror(args->fname);
++		ret = -1;
++		goto err_free_offsets;
++	}
++
++	if (mb->pargs->memset) {
++		if (mb->pargs->persist && mb->pargs->msync) {
++			fprintf(stderr,
++				"Invalid benchmark parameters: persist and msync cannot be specified together\n");
++			ret = -1;
++			goto err_free_offsets;
++		}
++
++		if (mb->pargs->persist) {
++			mb->func_op = libc_memset_persist;
++		} else {
++			mb->func_op = libc_memset;
++		}
++	} else {
++		mb->func_op = (mb->pargs->persist) ? libpmem_memset_persist
++						   : libpmem_memset_nodrain;
++	}
++
++	if (!mb->pargs->no_warmup && type != TYPE_DEVDAX) {
++		ret = warmup_func(mb);
++		if (ret) {
++			perror("Pool warmup failed");
++			goto err_free_offsets;
++		}
++	}
++
++	pmembench_set_priv(bench, mb);
++
++	return ret;
++
++err_free_offsets:
++	free(mb->offsets);
++err_free_mb:
++	free(mb);
++
++	return ret;
++}
++
++/*
++ * memset_exit -- benchmark cleanup function
++ */
++static int
++memset_exit(struct benchmark *bench, struct benchmark_args *args)
++{
++	auto *mb = (struct memset_bench *)pmembench_get_priv(bench);
++	pmem2_map_delete(&mb->map);
++	free(mb->offsets);
++	free(mb);
++	return 0;
++}
++
++static struct benchmark_clo memset_clo[6];
++/* Stores information about benchmark. */
++static struct benchmark_info memset_info;
++CONSTRUCTOR(pmem_memset_constructor)
++void
++pmem_memset_constructor(void)
++{
++	memset_clo[0].opt_short = 'M';
++	memset_clo[0].opt_long = "mem-mode";
++	memset_clo[0].descr = "Memory writing mode - "
++			      "stat, seq, rand";
++	memset_clo[0].def = "seq";
++	memset_clo[0].off = clo_field_offset(struct memset_args, mode);
++	memset_clo[0].type = CLO_TYPE_STR;
++
++	memset_clo[1].opt_short = 'm';
++	memset_clo[1].opt_long = "memset";
++	memset_clo[1].descr = "Use libc memset()";
++	memset_clo[1].def = "false";
++	memset_clo[1].off = clo_field_offset(struct memset_args, memset);
++	memset_clo[1].type = CLO_TYPE_FLAG;
++
++	memset_clo[2].opt_short = 'p';
++	memset_clo[2].opt_long = "persist";
++	memset_clo[2].descr = "Use pmem_persist()";
++	memset_clo[2].def = "true";
++	memset_clo[2].off = clo_field_offset(struct memset_args, persist);
++	memset_clo[2].type = CLO_TYPE_FLAG;
++
++	memset_clo[3].opt_short = 'D';
++	memset_clo[3].opt_long = "dest-offset";
++	memset_clo[3].descr = "Destination cache line alignment "
++			      "offset";
++	memset_clo[3].def = "0";
++	memset_clo[3].off = clo_field_offset(struct memset_args, dest_off);
++	memset_clo[3].type = CLO_TYPE_UINT;
++	memset_clo[3].type_uint.size =
++		clo_field_size(struct memset_args, dest_off);
++	memset_clo[3].type_uint.base = CLO_INT_BASE_DEC;
++	memset_clo[3].type_uint.min = 0;
++	memset_clo[3].type_uint.max = MAX_OFFSET;
++
++	memset_clo[4].opt_short = 'w';
++	memset_clo[4].opt_long = "no-warmup";
++	memset_clo[4].descr = "Don't do warmup";
++	memset_clo[4].def = "false";
++	memset_clo[4].type = CLO_TYPE_FLAG;
++	memset_clo[4].off = clo_field_offset(struct memset_args, no_warmup);
++
++	memset_clo[5].opt_short = 'S';
++	memset_clo[5].opt_long = "seed";
++	memset_clo[5].descr = "seed for random numbers";
++	memset_clo[5].def = "1";
++	memset_clo[5].off = clo_field_offset(struct memset_args, seed);
++	memset_clo[5].type = CLO_TYPE_UINT;
++	memset_clo[5].type_uint.size = clo_field_size(struct memset_args, seed);
++	memset_clo[5].type_uint.base = CLO_INT_BASE_DEC;
++	memset_clo[5].type_uint.min = 1;
++	memset_clo[5].type_uint.max = UINT_MAX;
++
++	memset_info.name = "pmem2_memset";
++	memset_info.brief = "Benchmark for pmem2_get_memset_fn()";
++	memset_info.init = memset_init;
++	memset_info.exit = memset_exit;
++	memset_info.multithread = true;
++	memset_info.multiops = true;
++	memset_info.operation = memset_op;
++	memset_info.measure_time = true;
++	memset_info.clos = memset_clo;
++	memset_info.nclos = ARRAY_SIZE(memset_clo);
++	memset_info.opts_size = sizeof(struct memset_args);
++	memset_info.rm_file = true;
++	memset_info.allow_poolset = false;
++	memset_info.print_bandwidth = true;
++	REGISTER_BENCHMARK(memset_info);
++};
+Binary files /pmdk-original/src/benchmarks/pmembench and /pmdk/src/benchmarks/pmembench differ
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem_flush.cpp /pmdk/src/benchmarks/pmem_flush.cpp
+--- /pmdk-original/src/benchmarks/pmem_flush.cpp	2021-05-07 15:16:49.969131123 +0200
++++ /pmdk/src/benchmarks/pmem_flush.cpp	2021-07-14 14:10:40.218450995 +0200
+@@ -153,6 +153,26 @@
+ }
+ 
+ /*
++ * flush_deep_persist -- flush data to persistence using pmem_deep_persist()
++ */
++static int
++flush_deep_persist(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	pmem_deep_persist(addr, len);
++	return 0;
++}
++
++/*
++ * flush_flush -- flush data without draining using pmem_flush()
++ */
++static int
++flush_flush(struct pmem_bench *pmb, void *addr, size_t len)
++{
++	pmem_flush(addr, len);
++	return 0;
++}
++
++/*
+  * flush_persist -- flush data to persistence using pmem_persist()
+  */
+ static int
+@@ -319,6 +339,9 @@
+ 	{"msync_async", flush_msync_async},
+ 	{"msync_nodirty", flush_msync_nodirty},
+ 	{"msync_invalid", flush_msync_invalid},
++
++	{"deep_persist", flush_deep_persist},
++	{"flush", flush_flush},
+ };
+ 
+ #define NOPS (sizeof(ops) / sizeof(ops[0]))
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem_memcpy.cpp /pmdk/src/benchmarks/pmem_memcpy.cpp
+--- /pmdk-original/src/benchmarks/pmem_memcpy.cpp	2021-05-07 16:50:29.441888101 +0200
++++ /pmdk/src/benchmarks/pmem_memcpy.cpp	2021-06-15 13:43:11.002687926 +0200
+@@ -81,6 +81,18 @@
+ 	 */
+ 	bool persist;
+ 
++	/*
++	 * When this flag is set to true, only libc_memcpy() is used
++	 */
++	bool skip_flush;
++
++	/*
++	 * When this flag is set to true, PMEM is not used.
++	 * This option is useful, when comparing performance
++	 * of pmem_memcpy() function to regular memcpy().
++	 */
++	bool memmove;
++
+ 	/* do not do warmup */
+ 	bool no_warmup;
+ };
+@@ -245,14 +257,36 @@
+ }
+ 
+ /*
++ * libc_memmove -- copy using libc memmove() function
++ */
++static int
++libc_memmove(void *dest, void *source, size_t len)
++{
++	memmove(dest, source, len);
++
++	return 0;
++}
++
++/*
+  * libc_memcpy -- copy using libc memcpy() function
+- * followed by pmem_flush().
+  */
+ static int
+ libc_memcpy(void *dest, void *source, size_t len)
+ {
+ 	memcpy(dest, source, len);
+ 
++	return 0;
++}
++
++/*
++ * libc_memcpy -- copy using libc memcpy() function
++ * followed by pmem_flush().
++ */
++static int
++libc_memcpy_flush(void *dest, void *source, size_t len)
++{
++	memcpy(dest, source, len);
++
+ 	pmem_flush(dest, len);
+ 
+ 	return 0;
+@@ -447,9 +481,16 @@
+ 		goto err_unmap;
+ 	}
+ 
+-	if (pmb->pargs->memcpy) {
+-		pmb->func_op =
+-			pmb->pargs->persist ? libc_memcpy_persist : libc_memcpy;
++	if (pmb->pargs->memmove) {
++		pmb->func_op = libc_memmove;
++	} else if (pmb->pargs->memcpy) {
++		if (pmb->pargs->skip_flush) {
++			pmb->func_op = libc_memcpy;
++		} else {
++			pmb->func_op =
++			pmb->pargs->persist ? libc_memcpy_persist : libc_memcpy_flush;
++		}
++		
+ 	} else {
+ 		pmb->func_op = pmb->pargs->persist ? libpmem_memcpy_persist
+ 						   : libpmem_memcpy_nodrain;
+@@ -516,7 +557,7 @@
+ }
+ 
+ /* structure to define command line arguments */
+-static struct benchmark_clo pmem_memcpy_clo[8];
++static struct benchmark_clo pmem_memcpy_clo[10];
+ 
+ /* Stores information about benchmark. */
+ static struct benchmark_info pmem_memcpy_bench;
+@@ -592,6 +633,20 @@
+ 	pmem_memcpy_clo[7].type = CLO_TYPE_FLAG;
+ 	pmem_memcpy_clo[7].off = clo_field_offset(struct pmem_args, no_warmup);
+ 
++	pmem_memcpy_clo[8].opt_short = 's';
++	pmem_memcpy_clo[8].opt_long = "skip-flush";
++	pmem_memcpy_clo[8].descr = "Only available with libc-memcpy; skip flush and persist";
++	pmem_memcpy_clo[8].def = "false";
++	pmem_memcpy_clo[8].type = CLO_TYPE_FLAG;
++	pmem_memcpy_clo[8].off = clo_field_offset(struct pmem_args, skip_flush);
++
++	pmem_memcpy_clo[9].opt_short = 'v';
++	pmem_memcpy_clo[9].opt_long = "libc-memmove";
++	pmem_memcpy_clo[9].descr = "Only available with libc-memmove; skip flush and persist";
++	pmem_memcpy_clo[9].def = "false";
++	pmem_memcpy_clo[9].type = CLO_TYPE_FLAG;
++	pmem_memcpy_clo[9].off = clo_field_offset(struct pmem_args, memmove);
++
+ 	pmem_memcpy_bench.name = "pmem_memcpy";
+ 	pmem_memcpy_bench.brief = "Benchmark for"
+ 				  "pmem_memcpy_persist() and "
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmdk-original/src/benchmarks/pmem_memset.cpp /pmdk/src/benchmarks/pmem_memset.cpp
+--- /pmdk-original/src/benchmarks/pmem_memset.cpp	2021-05-07 16:50:29.441888101 +0200
++++ /pmdk/src/benchmarks/pmem_memset.cpp	2021-05-07 15:51:28.703611145 +0200
+@@ -32,6 +32,7 @@
+ 	bool memset;	   /* use libc memset function */
+ 	bool persist;	   /* perform persist operation */
+ 	bool msync;	   /* perform msync operation */
++	bool skip_flush; /* perform libc_memset without flush */
+ 	bool no_warmup;	   /* do not do warmup */
+ 	size_t chunk_size; /* elementary chunk size */
+ 	size_t dest_off;   /* destination address offset */
+@@ -177,7 +178,7 @@
+  * followed by pmem_flush().
+  */
+ static int
+-libc_memset(void *dest, int c, size_t len)
++libc_memset_flush(void *dest, int c, size_t len)
+ {
+ 	memset(dest, c, len);
+ 
+@@ -187,6 +188,17 @@
+ }
+ 
+ /*
++ * libc_memset -- perform operation only using libc memset() function
++ */
++static int
++libc_memset(void *dest, int c, size_t len)
++{
++	memset(dest, c, len);
++
++	return 0;
++}
++
++/*
+  * warmup_persist -- does the warmup by writing the whole pool area
+  */
+ static int
+@@ -326,7 +338,11 @@
+ 			mb->func_op = libc_memset_msync;
+ 			warmup_func = warmup_msync;
+ 		} else {
+-			mb->func_op = libc_memset;
++			if (mb->pargs->skip_flush) {
++				mb->func_op = libc_memset;
++			} else{
++				mb->func_op = libc_memset_flush;
++			}
+ 		}
+ 	} else {
+ 		mb->func_op = (mb->pargs->persist) ? libpmem_memset_persist
+@@ -366,7 +382,7 @@
+ 	return 0;
+ }
+ 
+-static struct benchmark_clo memset_clo[7];
++static struct benchmark_clo memset_clo[8];
+ /* Stores information about benchmark. */
+ static struct benchmark_info memset_info;
+ CONSTRUCTOR(pmem_memset_constructor)
+@@ -433,6 +449,13 @@
+ 	memset_clo[6].off = clo_field_offset(struct memset_args, msync);
+ 	memset_clo[6].type = CLO_TYPE_FLAG;
+ 
++	memset_clo[7].opt_short = 's';
++	memset_clo[7].opt_long = "skip-flush";
++	memset_clo[7].descr = "Use only libc memset()";
++	memset_clo[7].def = "false";
++	memset_clo[7].off = clo_field_offset(struct memset_args, skip_flush);
++	memset_clo[7].type = CLO_TYPE_FLAG;
++
+ 	memset_info.name = "pmem_memset";
+ 	memset_info.brief = "Benchmark for pmem_memset_persist() "
+ 			    "and pmem_memset_nodrain() operations";

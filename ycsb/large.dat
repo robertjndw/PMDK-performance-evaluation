@@ -1,0 +1,11 @@
+# 100K Records
+recordcount=100000
+# 1 Mio Operations
+operationcount=1000000
+
+# Data size: 1 KB records (1 field, 1024 bytes each, plus key)
+fieldcount=1
+fieldlength=1024
+
+# Key size 32B
+zeropadding=28

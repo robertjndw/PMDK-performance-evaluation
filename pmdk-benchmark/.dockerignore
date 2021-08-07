@@ -1,0 +1,10 @@
+# Ignore csv files of results
+**/*.csv
+# Small script which was used to get the patch file
+create-patch.sh
+# Git files
+.gitignore
+.git
+# Result folder
+results
+README.md

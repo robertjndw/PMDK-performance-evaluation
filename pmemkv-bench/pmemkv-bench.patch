@@ -1,0 +1,52 @@
+diff -ruN -x '*.o' -x .deps -x '*.cfg' /pmemkv-bench-original/bench/db_bench.cc /pmemkv-bench/bench/db_bench.cc
+--- /pmemkv-bench-original/bench/db_bench.cc	2021-07-09 21:12:24.927081867 +0200
++++ /pmemkv-bench/bench/db_bench.cc	2021-07-10 03:08:34.219866005 +0200
+@@ -44,6 +44,8 @@
+ 	"--histogram=<0|1>          (show histograms when reporting latencies)\n"
+ 	"--num=<integer>            (number of keys to place in database, default: 1000000)\n"
+ 	"--reads=<integer>          (number of read operations, default: 1000000)\n"
++	"--miss_rate=<integer>      (percentage of read which should result in a miss. "
++	"The default value 10 means 10% of read operations will result in a miss\n"
+ 	"--threads=<integer>        (number of concurrent threads, default: 1)\n"
+ 	"--key_size=<integer>       (size of keys in bytes, default: 8)\n"
+ 	"--value_size=<integer>     (size of values in bytes, default: 100)\n"
+@@ -79,6 +81,9 @@
+ /* Number of read operations to do. If negative, do FLAGS_num reads. */
+ static int FLAGS_reads = -1;
+ 
++/* Percentage of miss operation during reads, only applies if entries < reads */
++static int FLAGS_miss_rate = 10;
++
+ /* Number of concurrent threads to run. */
+ static int FLAGS_threads = 1;
+ 
+@@ -873,8 +878,19 @@
+ 		auto start = FLAGS_disjoint ? thread->tid * num : 0;
+ 		auto end = FLAGS_disjoint ? (thread->tid + 1) * num : reads_;
+ 
++		int counter_misses = (int)num * ((float) FLAGS_miss_rate / 100.0);
++		int counter_hits = num - counter_misses;
++		Random rnd(time(NULL));
++
+ 		for (int i = start; i < end; i++) {
+-			const int k = seq ? i : (thread->rand.Next() % num) + start;
++			int k;
++			if(counter_misses != 0 && (counter_hits == 0 || rnd.Uniform(100) < FLAGS_miss_rate)){
++				k = i + num_;
++				counter_misses--;
++			} else {
++				k = seq ? (i % num_) : (thread->rand.Next() % num_) + start;
++				counter_hits--;
++			}
+ 			GenerateKeyFromInt(k, &key, missing);
+ 			std::string value;
+ 			if (kv_->get(key.ToString(), &value) == pmem::kv::status::OK)
+@@ -1072,6 +1088,8 @@
+ 			FLAGS_num = n;
+ 		} else if (sscanf(argv[i], "--reads=%d%c", &n, &junk) == 1) {
+ 			FLAGS_reads = n;
++		} else if (sscanf(argv[i], "--miss_rate=%d%c", &n, &junk) == 1) {
++			FLAGS_miss_rate = n;
+ 		} else if (sscanf(argv[i], "--threads=%d%c", &n, &junk) == 1) {
+ 			FLAGS_threads = n;
+ 		} else if (sscanf(argv[i], "--key_size=%d%c", &n, &junk) == 1) {

@@ -1,0 +1,9 @@
+# ignore the result folders
+results/
+README.md
+# Experimental scripts
+start-server.sh
+start-YCSB-postgresql-thread.sh
+run-YCSB-rocksdb.sh
+# Dependencies
+*/rocksdbjni-6.2.2.jar

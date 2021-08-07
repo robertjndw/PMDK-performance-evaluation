@@ -1,0 +1,218 @@
+From 66b102ae7a7e5fbb904e45e71ea8758c730b9b3d Mon Sep 17 00:00:00 2001
+From: Takashi Menjo <takashi.menjou.vg@hco.ntt.co.jp>
+Date: Tue, 4 Aug 2020 12:59:29 +0900
+Subject: [PATCH v5 1/3] Add configure option for PMDK
+
+Author: Yoshimi Ichiyanagi <ichiyanagi.yoshimi@lab.ntt.co.jp>
+---
+ configure                  | 92 ++++++++++++++++++++++++++++++++++++++
+ configure.ac               | 16 +++++++
+ src/include/pg_config.h.in |  6 +++
+ 3 files changed, 114 insertions(+)
+
+diff --git a/configure b/configure
+index 8af4b99021..2b54b8618d 100755
+--- a/configure
++++ b/configure
+@@ -700,6 +700,7 @@ LDFLAGS_SL
+ LDFLAGS_EX
+ with_zlib
+ with_system_tzdata
++with_libpmem
+ with_libxslt
+ XML2_LIBS
+ XML2_CFLAGS
+@@ -864,6 +865,7 @@ with_uuid
+ with_ossp_uuid
+ with_libxml
+ with_libxslt
++with_libpmem
+ with_system_tzdata
+ with_zlib
+ with_gnu_ld
+@@ -1567,6 +1569,7 @@ Optional Packages:
+   --with-ossp-uuid        obsolete spelling of --with-uuid=ossp
+   --with-libxml           build with XML support
+   --with-libxslt          use XSLT support when building contrib/xml2
++  --with-libpmem          use PMEM support for WAL I/O
+   --with-system-tzdata=DIR
+                           use system time zone data in DIR
+   --without-zlib          do not use Zlib
+@@ -8543,6 +8546,33 @@ fi
+ 
+ 
+ 
++#
++# PMEM
++#
++
++
++
++# Check whether --with-libpmem was given.
++if test "${with_libpmem+set}" = set; then :
++  withval=$with_libpmem;
++  case $withval in
++    yes)
++
++$as_echo "#define USE_LIBPMEM 1" >>confdefs.h
++
++      ;;
++    no)
++      :
++      ;;
++    *)
++      as_fn_error $? "no argument expected for --with-libpmem option" "$LINENO" 5
++      ;;
++  esac
++
++else
++  with_libpmem=no
++
++fi
+ 
+ 
+ 
+@@ -12592,6 +12622,57 @@ fi
+ 
+ fi
+ 
++if test "$with_libpmem" = yes ; then
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for pmem_map_file in -lpmem" >&5
++$as_echo_n "checking for pmem_map_file in -lpmem... " >&6; }
++if ${ac_cv_lib_pmem_pmem_map_file+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  ac_check_lib_save_LIBS=$LIBS
++LIBS="-lpmem  $LIBS"
++cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++/* Override any GCC internal prototype to avoid an error.
++   Use char because int might match the return type of a GCC
++   builtin and then its argument prototype would still apply.  */
++#ifdef __cplusplus
++extern "C"
++#endif
++char pmem_map_file ();
++int
++main ()
++{
++return pmem_map_file ();
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"; then :
++  ac_cv_lib_pmem_pmem_map_file=yes
++else
++  ac_cv_lib_pmem_pmem_map_file=no
++fi
++rm -f core conftest.err conftest.$ac_objext \
++    conftest$ac_exeext conftest.$ac_ext
++LIBS=$ac_check_lib_save_LIBS
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_pmem_pmem_map_file" >&5
++$as_echo "$ac_cv_lib_pmem_pmem_map_file" >&6; }
++if test "x$ac_cv_lib_pmem_pmem_map_file" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_LIBPMEM 1
++_ACEOF
++
++  LIBS="-lpmem $LIBS"
++
++else
++  as_fn_error $? "library 'pmwm' is required for PMEM support" "$LINENO" 5
++fi
++
++fi
++
++
+ # Note: We can test for libldap_r only after we know PTHREAD_LIBS
+ if test "$with_ldap" = yes ; then
+   _LIBS="$LIBS"
+@@ -13418,6 +13499,17 @@ else
+ fi
+ 
+ 
++fi
++
++if test "$with_libpmem" = yes ; then
++  ac_fn_c_check_header_mongrel "$LINENO" "libpmem.h" "ac_cv_header_libpmem_h" "$ac_includes_default"
++if test "x$ac_cv_header_libpmem_h" = xyes; then :
++
++else
++  as_fn_error $? "header file <libpmem.h> is required for PMEM support" "$LINENO" 5
++fi
++
++
+ fi
+ 
+ if test "$with_ldap" = yes ; then
+diff --git a/configure.ac b/configure.ac
+index 868a94c9ba..8e40247352 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -985,6 +985,14 @@ PGAC_ARG_BOOL(with, libxslt, no, [use XSLT support when building contrib/xml2],
+ 
+ AC_SUBST(with_libxslt)
+ 
++#
++# PMEM
++#
++PGAC_ARG_BOOL(with, libpmem, no, [use PMEM support for WAL I/O],
++	      [AC_DEFINE([USE_LIBPMEM], 1, [Define to 1 to use PMEM support for WAL I/O. (--with-libpmem)])])
++
++AC_SUBST(with_libpmem)
++
+ #
+ # tzdata
+ #
+@@ -1247,6 +1255,10 @@ if test "$with_libxslt" = yes ; then
+   AC_CHECK_LIB(xslt, xsltCleanupGlobals, [], [AC_MSG_ERROR([library 'xslt' is required for XSLT support])])
+ fi
+ 
++if test "$with_libpmem" = yes ; then
++  AC_CHECK_LIB(pmem, pmem_map_file, [], [AC_MSG_ERROR([library 'pmem' is required for PMEM support])])
++fi
++
+ # Note: We can test for libldap_r only after we know PTHREAD_LIBS
+ if test "$with_ldap" = yes ; then
+   _LIBS="$LIBS"
+@@ -1433,6 +1445,10 @@ if test "$with_libxslt" = yes ; then
+   AC_CHECK_HEADER(libxslt/xslt.h, [], [AC_MSG_ERROR([header file <libxslt/xslt.h> is required for XSLT support])])
+ fi
+ 
++if test "$with_libpmem" = yes ; then
++  AC_CHECK_HEADER(libpmem.h, [], [AC_MSG_ERROR([header file <libpmem.h> is required for PMEM support])])
++fi
++
+ if test "$with_ldap" = yes ; then
+   if test "$PORTNAME" != "win32"; then
+      AC_CHECK_HEADERS(ldap.h, [],
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index f4d9f3b408..977746922a 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -343,6 +343,9 @@
+ /* Define to 1 if you have the `xslt' library (-lxslt). */
+ #undef HAVE_LIBXSLT
+ 
++/* Define to 1 if you have the `pmem' library (-lpmem). */
++#undef HAVE_LIBPMEM
++
+ /* Define to 1 if you have the `z' library (-lz). */
+ #undef HAVE_LIBZ
+ 
+@@ -896,6 +899,9 @@
+ /* Define to 1 to build with LLVM based JIT support. (--with-llvm) */
+ #undef USE_LLVM
+ 
++/* Define to 1 to use PMEM support for WAL I/O. (--with-libpmem) */
++#undef USE_LIBPMEM
++
+ /* Define to select named POSIX semaphores. */
+ #undef USE_NAMED_POSIX_SEMAPHORES
+ 
+-- 
+2.25.1
+

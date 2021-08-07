@@ -1,0 +1,5 @@
+# ignore the result folders
+fill/
+read/
+readwrite/
+results/
